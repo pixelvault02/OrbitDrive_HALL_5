@@ -1,0 +1,13 @@
+OrbitDrive_HALL_3 closed-loop PID tune
+node=1 dwell=1.6s targets=[0.0, 4.0, -4.0, 8.0, 0.0]
+
+BEST:
+  angle_p=1.50  vel_p=0.030  vel_i=0.600  vel_d=0.000  ramp=300.0  lpf=0.0800
+  score=40.06  steps_ok=3/5
+
+TOP 5:
+  1. score=40.1 ok=3/5  A=1.5 Vp=0.030 Vi=0.60 R=300 LPF=0.080
+  2. score=40.1 ok=3/5  A=1.5 Vp=0.030 Vi=0.60 R=50 LPF=0.020
+  3. score=41.3 ok=3/5  A=1.5 Vp=0.030 Vi=0.60 R=50 LPF=0.050
+  4. score=41.4 ok=3/5  A=1.5 Vp=0.030 Vi=0.60 R=300 LPF=0.050
+  5. score=42.2 ok=3/5  A=1.5 Vp=0.030 Vi=0.60 R=300 LPF=0.020

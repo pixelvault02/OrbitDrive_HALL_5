@@ -1,0 +1,12 @@
+# PlatformIO build output
+.pio/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db

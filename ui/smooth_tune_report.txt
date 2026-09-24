@@ -1,0 +1,14 @@
+OrbitDrive_HALL_4 smooth CAN closed-loop tune
+port=COM12 node=2
+soft=[-40.0,40.0]
+BEST gains:
+  vel_p=0.013
+  vel_i=0.08
+  vel_d=0.00014
+  vel_ramp=70.0
+  angle_p=25.0
+  lpf=0.75
+  slew=80.0
+  accel=500.0
+  decel=575.0
+metrics: score=10.341 rmse=1.991 over=0.908 jerk=242.4 settle=0.63

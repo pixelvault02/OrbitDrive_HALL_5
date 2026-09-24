@@ -1,0 +1,71 @@
+OrbitDrive_HALL_4 closed-loop oscillation analysis
+time=2026-09-11 19:34:24
+amps_planned=[15, 30, 45, 60, 75, 90]  amps_run=[15, 30, 45, 60, 75, 90]  cycles_each=10
+soft_limits_reported=[-90.0,90.0]
+raw_csv=C:\Users\sethu\OrbitDrive_HALL_4\ui\osc_analysis_raw.csv
+
+--- Per-amplitude summary ---
+AMP ±15°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-14.73, +15.48]
+  max_abs_tracking_err=13.13°
+  max_abs_uq=0.2574
+  settle_s mean=1.46 max=1.60
+  overshoot_+ mean=0.00 max=0.00
+  overshoot_- mean=0.07 max=0.78
+
+AMP ±30°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-29.62, +29.68]
+  max_abs_tracking_err=24.54°
+  max_abs_uq=0.3601
+  settle_s mean=1.84 max=1.86
+  overshoot_+ mean=0.00 max=0.00
+  overshoot_- mean=0.04 max=0.40
+
+AMP ±45°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-44.66, +45.92]
+  max_abs_tracking_err=27.10°
+  max_abs_uq=0.7117
+  settle_s mean=2.06 max=2.13
+  overshoot_+ mean=0.18 max=0.92
+  overshoot_- mean=0.06 max=0.68
+
+AMP ±60°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-59.67, +59.48]
+  max_abs_tracking_err=35.01°
+  max_abs_uq=0.5955
+  settle_s mean=2.23 max=2.41
+  overshoot_+ mean=0.00 max=0.00
+  overshoot_- mean=0.04 max=0.49
+
+AMP ±75°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-76.20, +74.76]
+  max_abs_tracking_err=36.68°
+  max_abs_uq=0.5670
+  settle_s mean=2.34 max=2.41
+  overshoot_+ mean=0.00 max=0.00
+  overshoot_- mean=0.37 max=1.20
+
+AMP ±90°
+  cycles_completed=10/10
+  aborted=False  
+  peak_actual=[-92.78, +88.72]
+  max_abs_tracking_err=37.09°
+  max_abs_uq=0.5873
+  settle_s mean=2.86 max=3.46
+  overshoot_+ mean=0.00 max=0.00
+  overshoot_- mean=0.04 max=0.40
+
+--- Irregularities ---
+None flagged by automated checks.
+
+On jam: firmware trips ENDSTOP FAULT + motor.disable(); script also sends ORBIT_CMD_SET_ENABLE 0.
