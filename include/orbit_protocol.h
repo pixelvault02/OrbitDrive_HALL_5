@@ -40,6 +40,9 @@
 #define ORBIT_CMD_SET_NODE     0x08   // uint8 new node id (0..15); saves + reboots
 #define ORBIT_CMD_SET_VEL      0x09   // float32 mechanical rpm (0 = return to angle hold)
 #define ORBIT_CMD_SET_ENABLE   0x0A   // uint8: 0=disable, 1=enable (clears endstop fault)
+#define ORBIT_CMD_REBOOT       0x0B   // no payload; reset the MCU
+#define ORBIT_CMD_MEASURE_STOPS 0x0C  // no payload; sweep both stops and save the span
+#define ORBIT_CMD_HEARTBEAT    0x0D   // no payload; UI link is still up
 
 // Readout offsets (added to a node's readout base) — TX -> host
 #define ORBIT_RPT_TELEMETRY    0x01   // float32 desired + float32 actual (deg)
@@ -69,7 +72,8 @@
 #define ORBIT_PARAM_DECEL     16   // angle profile decel (deg/s^2); 0 = use accel
 #define ORBIT_PARAM_SOFT_MIN  17   // soft limit min (deg), typically negative
 #define ORBIT_PARAM_SOFT_MAX  18   // soft limit max (deg), typically positive
-#define ORBIT_PARAM_COUNT     19
+#define ORBIT_PARAM_PRESTOP   19   // degrees inside each measured hard stop
+#define ORBIT_PARAM_COUNT     20
 
 #define ORBIT_DEF_VEL_P     0.026f
 #define ORBIT_DEF_VEL_I     0.30f
@@ -92,6 +96,7 @@
 #define ORBIT_DEF_DECEL     1000.0f  // deg/s^2
 #define ORBIT_DEF_SOFT_MIN  ORBIT_ANGLE_MIN_DEG
 #define ORBIT_DEF_SOFT_MAX  ORBIT_ANGLE_MAX_DEG
+#define ORBIT_DEF_PRESTOP   2.0f     // software stop, degrees inside each hard stop
 #define ORBIT_SLEW_MAX      1500.0f  // deg/s hard max
 #define ORBIT_ACCEL_MAX     5000.0f  // deg/s^2 hard max
 #define ORBIT_DEF_CAN_NODE  1        // pitch/tilt node
@@ -106,7 +111,7 @@
 // Persisted configuration (flash-emulated EEPROM) ------------------------------
 // Distinct magic from OrbitDrive3.0 (MT6835) so configs are not mixed.
 #define ORBIT_CFG_MAGIC   0x0B17C103UL
-#define ORBIT_CFG_VERSION 23  // soft window -135/+135 for the pendulum sweep
+#define ORBIT_CFG_VERSION 26  // editable prestop inset; sweep still comes from the stops
 
 struct OrbitConfig {
   uint32_t magic;                // ORBIT_CFG_MAGIC when valid
@@ -146,4 +151,10 @@ struct OrbitConfig {
   // Soft angle window (deg). Clamped to hard-span after boot home.
   float    soft_min_deg;
   float    soft_max_deg;
+
+  // Measured hard stops, degrees from the midpoint zero. 1 = use one-stop home.
+  uint8_t  stops_valid;
+  float    stop_ccw_deg;
+  float    stop_cw_deg;
+  float    prestop_deg;              // software end stop, degrees inside each hard stop
 };

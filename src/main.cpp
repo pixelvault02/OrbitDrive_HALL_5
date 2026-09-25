@@ -60,15 +60,17 @@
 // Home holds a slow shaft speed with a 50 Hz current trim. The fast
 // velocity PID is not used — hall speed noise is what made homing buzz.
 #define BOOT_AUTO_HOME       1
-#define HOME_CRUISE_DPS      80.0f   // seek and descent
+#define HOME_CRUISE_DPS      150.0f  // seek and descent
 #define HOME_CREEP_DPS       40.0f   // back off a stop
-#define HOME_REVERSE_ACCEL   60.0f   // deg/s^2 leaving an end stop
+#define HOME_REVERSE_ACCEL   80.0f   // deg/s^2 on the startup sweep
 #define HOME_ARREST_MS       200UL   // motion stopped → leave at once
+#define HOME_BLOCK_MS        1000UL  // no real progress → drop torque
+#define HOME_PROGRESS_DEG    2.0f    // filtered motion that counts as moving
 #define HOME_IQ_SLEW         2.0f    // A/s — reverse to brake a fall
 #define HOME_SEEK_RPM        8.0f    // sign only (direction)
 #define HOME_TIMEOUT_MS      22000UL
 #define HOME_MIN_TRAVEL_DEG  15.0f
-#define HOME_NO_MOVE_MS      1800UL
+#define HOME_NO_MOVE_MS      1000UL
 #define HOME_UNSTICK_DEG     5.0f
 #define HOME_END_OFFSET_DEG  8.0f
 #define HOME_CLEAR_FRAC      0.08f
@@ -78,12 +80,9 @@
 // Hard travel is about 270° end to end, not an exact angle.
 #define HOME_SPAN_MIN_DEG    200.0f
 #define HOME_SPAN_MAX_DEG    340.0f
-#define TRAVEL_MARGIN_DEG    0.5f
+#define TRAVEL_MARGIN_DEG    ORBIT_DEF_PRESTOP
 #define SOFT_TRAVEL_DEG      90.0f   // fallback until home (pitch CW side)
-// End-zone protect (does not change PID gains)
-#define END_ZONE_DEG         6.0f
-#define END_SLEW_SCALE       0.35f
-#define FOLDBACK_CURRENT_A   0.08f
+// Jam detect only. Do not cut current near the stop — that made the hold oscillate.
 #define JAM_ERR_DEG          12.0f
 #define JAM_VEL_RAD_S        0.12f
 #define JAM_UQ_ABS           0.85f
@@ -127,6 +126,7 @@ static void applyCanNode(uint8_t node) {
 // State
 // ---------------------------------------------------------------------------
 OrbitConfig cfg;
+static void saveConfig(bool calib_valid = true);
 float mech_zero_offset = 0.0f;
 float cmd_angle_deg = 0.0f;
 float target_position = 0.0f;   // FOC angle setpoint (profiled)
@@ -149,6 +149,13 @@ static float home_track_prev = 0.0f;
 static bool vel_mode = false;
 static float target_vel_mech = 0.0f;  // rad/s when vel_mode
 static bool endstop_fault = false;    // latched; cleared by SET_ENABLE 1
+static bool home_locked = false;      // span mismatch gave up; only a reboot clears it
+static uint32_t last_link_ms = 0;
+static bool link_held = false;
+#define HOME_SPAN_TRIES      3
+#define HOME_SPAN_MATCH_DEG  15.0f
+#define HOME_RETRY_MS        3000UL
+#define CAN_LINK_IDLE_MS     800UL
 static uint32_t jam_sense_t0 = 0;
 static uint32_t jam_grace_until = 0;   // millis deadline — skip jam trip
 
@@ -201,13 +208,20 @@ static float wrapPI(float a) {
   return a;
 }
 
+static float prestopDeg() {
+  float m = cfg.prestop_deg;
+  if (isnan(m) || isinf(m) || m < 0.0f) m = ORBIT_DEF_PRESTOP;
+  if (m > 40.0f) m = 40.0f;
+  return m;
+}
+
 static float softMinDeg() {
-  if (soft_limits_valid) return travel_min_deg + TRAVEL_MARGIN_DEG;
+  if (soft_limits_valid) return travel_min_deg + prestopDeg();
   return ORBIT_ANGLE_MIN_DEG;
 }
 
 static float softMaxDeg() {
-  if (soft_limits_valid) return travel_max_deg - TRAVEL_MARGIN_DEG;
+  if (soft_limits_valid) return travel_max_deg - prestopDeg();
   return ORBIT_ANGLE_MAX_DEG;
 }
 
@@ -269,18 +283,17 @@ static bool adoptPitchFromTracks(float ccw_track, float cw_track) {
   float ang_cw = cw_track - zero_track;    // about +135
   float ang_lo = fminf(ang_ccw, ang_cw);
   float ang_hi = fmaxf(ang_ccw, ang_cw);
-  float clear = fmaxf(HOME_END_OFFSET_DEG, HOME_CLEAR_FRAC * span_abs);
-  if (clear > span_abs * 0.15f) clear = span_abs * 0.15f;
-  hard_min_deg = ang_lo + clear;
-  hard_max_deg = ang_hi - clear;
-  if (hard_max_deg < hard_min_deg + 10.0f) {
-    hard_min_deg = ang_lo + 1.0f;
-    hard_max_deg = ang_hi - 1.0f;
-  }
+  // Measured stops stay in EEPROM. Commands stop 2° inside each one.
+  hard_min_deg = ang_lo;
+  hard_max_deg = ang_hi;
   hard_limits_valid = true;
-  cfg.soft_min_deg = ORBIT_DEF_SOFT_MIN;
-  cfg.soft_max_deg = ORBIT_DEF_SOFT_MAX;
+  cfg.stops_valid = 1;
+  cfg.stop_ccw_deg = ang_lo;
+  cfg.stop_cw_deg = ang_hi;
+  cfg.soft_min_deg = ang_lo;
+  cfg.soft_max_deg = ang_hi;
   applySoftWindow();
+  saveConfig(cfg.calib_valid != 0);
 
   Serial.print(F("  zero at mid  span="));
   Serial.print(span_abs, 1);
@@ -301,7 +314,11 @@ static void clearPidIntegrals() {
   motor.PID_current_d.reset();
 }
 
-static void setMotorEnable(bool on) {
+static void setMotorEnable(bool on, bool force = false) {
+  if (on && home_locked && !force) {
+    Serial.println(F("MOTOR enable blocked — home span failed, reboot required"));
+    return;
+  }
   if (on) {
     endstop_fault = false;
     jam_sense_t0 = 0;
@@ -345,8 +362,10 @@ static void applyAngleCommand(float deg) {
   vel_mode = false;
   motor.controller = MotionControlType::angle;
   cmd_angle_deg = constrain(deg, softMinDeg(), softMaxDeg());
-  float raw = mech_zero_offset + cmd_angle_deg * DEG2RAD;
-  angle_goal = motor.shaft_angle + wrapPI(raw - motor.shaft_angle);
+  // Travel is ~239°, so the two stops are more than 180° apart. wrapPI would
+  // take the short arc out through the stop already under the shaft.
+  float along = (cmd_angle_deg - actualDeg()) * DEG2RAD;
+  angle_goal = motor.shaft_angle + along;
   // Slew <= 0 → snap immediately
   if (cfg.slew_rate <= 0.05f) {
     target_position = angle_goal;
@@ -362,7 +381,7 @@ static void stepAngleSlew(float dt) {
   if (dt < 1e-5f) dt = 1e-5f;
   if (dt > 0.05f) dt = 0.05f;
 
-  float err = wrapPI(angle_goal - target_position);
+  float err = angle_goal - target_position;
   if (cfg.slew_rate <= 0.05f) {
     target_position = angle_goal;
     profile_vel = 0.0f;
@@ -370,14 +389,6 @@ static void stepAngleSlew(float dt) {
   }
 
   float vmax = cfg.slew_rate * DEG2RAD;
-  float act = actualDeg();
-  float lo = softMinDeg();
-  float hi = softMaxDeg();
-  if (err > 0.0f && (hi - act) < END_ZONE_DEG) {
-    vmax *= END_SLEW_SCALE;
-  } else if (err < 0.0f && (act - lo) < END_ZONE_DEG) {
-    vmax *= END_SLEW_SCALE;
-  }
 
   float a_acc = cfg.accel_rate * DEG2RAD;
   float a_dec = cfg.decel_rate * DEG2RAD;
@@ -434,24 +445,19 @@ static void stepAngleSlew(float dt) {
   }
 }
 
-/** Current foldback near soft ends + jam detect → motor disable. */
+/** Jam detect → motor disable. Angle mode keeps the full 0.5 A ceiling at the stop. */
 static void protectSoftEnds() {
   if (home_move || endstop_fault || !motor.enabled) return;
+
+  if (motor.current_limit != MAX_CURRENT_A) {
+    motor.current_limit = MAX_CURRENT_A;
+    motor.PID_velocity.limit = MAX_CURRENT_A;
+  }
 
   float act = actualDeg();
   float des = desiredDeg();
   float lo = softMinDeg();
   float hi = softMaxDeg();
-  float dist_lo = act - lo;
-  float dist_hi = hi - act;
-  bool near_end = (dist_lo < END_ZONE_DEG) || (dist_hi < END_ZONE_DEG);
-
-  float cur_lim = MAX_CURRENT_A;
-  if (near_end) cur_lim = FOLDBACK_CURRENT_A;
-  if (motor.current_limit != cur_lim) {
-    motor.current_limit = cur_lim;
-    motor.PID_velocity.limit = cur_lim;
-  }
 
   // Do NOT disable for "past soft" — after a hard-stop home the shaft often sits
   // slightly outside the soft window; that used to max-torque then trip.
@@ -528,7 +534,7 @@ static bool loadConfigAnyVersion() {
   return configMagicOk();
 }
 
-static void saveConfig(bool calib_valid = true) {
+static void saveConfig(bool calib_valid) {
   cfg.magic = ORBIT_CFG_MAGIC;
   cfg.version = ORBIT_CFG_VERSION;
   cfg.calib_valid = calib_valid ? 1 : 0;
@@ -559,6 +565,7 @@ static void setDefaultTuning() {
   cfg.decel_rate = ORBIT_DEF_DECEL;
   cfg.soft_min_deg = ORBIT_DEF_SOFT_MIN;
   cfg.soft_max_deg = ORBIT_DEF_SOFT_MAX;
+  cfg.prestop_deg = ORBIT_DEF_PRESTOP;
 }
 
 // Push tuning into motor + hall EKF.
@@ -616,6 +623,7 @@ static float getParam(uint8_t idx) {
     case ORBIT_PARAM_DECEL:    return cfg.decel_rate;
     case ORBIT_PARAM_SOFT_MIN: return cfg.soft_min_deg;
     case ORBIT_PARAM_SOFT_MAX: return cfg.soft_max_deg;
+    case ORBIT_PARAM_PRESTOP:  return prestopDeg();
     default: return 0.0f;
   }
 }
@@ -648,6 +656,11 @@ static void setParam(uint8_t idx, float v) {
     case ORBIT_PARAM_SOFT_MAX:
       cfg.soft_max_deg = v;
       applySoftWindow();
+      applyAngleCommand(cmd_angle_deg);
+      return;
+    case ORBIT_PARAM_PRESTOP:
+      cfg.prestop_deg = v;
+      cfg.prestop_deg = prestopDeg();
       applyAngleCommand(cmd_angle_deg);
       return;
     default: return;
@@ -919,7 +932,17 @@ static void homeRampSpeed(float v_target, float accel, float dt) {
   motor.move(target_position);
 }
 
+static void releaseSeekTorque() {
+  home_v_cmd = 0.0f;
+  sensor.update();
+  target_position = motor.shaft_angle;
+  angle_goal = target_position;
+  motor.loopFOC();
+  motor.move(target_position);
+}
+
 static bool driveUntilStall(float rpm, uint32_t timeout_ms, bool reverse_from_stop) {
+  (void)reverse_from_stop;
   const float sign = (rpm >= 0.0f) ? 1.0f : -1.0f;
   const float v_target = sign * HOME_CRUISE_DPS;
   home_move = true;
@@ -927,13 +950,15 @@ static bool driveUntilStall(float rpm, uint32_t timeout_ms, bool reverse_from_st
   motor.loopFOC();
   homeTrackStep();
   home_cmd_track = home_track_deg;
-  home_v_cmd = reverse_from_stop ? 0.0f : v_target;
+  home_v_cmd = 0.0f;
   float start_track = home_track_deg;
+  float filt = start_track;
+  float progress_mark = start_track;
   float extreme_track = start_track;
   uint32_t still_ms = millis();
   uint32_t t0 = still_ms;
   uint32_t last = t0;
-  const float accel = reverse_from_stop ? HOME_REVERSE_ACCEL : 10000.0f;
+  const float accel = HOME_REVERSE_ACCEL;
   while (millis() - t0 < timeout_ms) {
     uint32_t now = millis();
     float dt = (now - last) * 0.001f;
@@ -942,40 +967,35 @@ static bool driveUntilStall(float rpm, uint32_t timeout_ms, bool reverse_from_st
     motor.loopFOC();
     homeTrackStep();
     homeRampSpeed(v_target, accel, dt);
-    float gained = (home_track_deg - extreme_track) * sign;
-    if (gained > 0.4f) {
-      extreme_track = home_track_deg;
+    float alpha = dt / (0.05f + dt);
+    filt += alpha * (home_track_deg - filt);
+    float gained = (filt - progress_mark) * sign;
+    if (gained > HOME_PROGRESS_DEG) {
+      progress_mark = filt;
+      extreme_track = filt;
       home_hard_shaft = motor.shaft_angle;
       home_hard_track = extreme_track;
       still_ms = now;
     }
-    float travel_deg = fabsf(extreme_track - start_track);
-    float back = (extreme_track - home_track_deg) * sign;
-    if (travel_deg >= 20.0f && back < 1.5f && (now - still_ms) > HOME_ARREST_MS) {
-      home_hard_track = extreme_track;
-      home_v_cmd = 0.0f;
-      target_position = motor.shaft_angle;
-      angle_goal = target_position;
-      motor.move(target_position);
-      Serial.print(F("  END track="));
-      Serial.print(extreme_track, 1);
-      Serial.print(F("  travel="));
+    if ((now - still_ms) > HOME_BLOCK_MS) {
+      float travel_deg = fabsf(extreme_track - start_track);
+      releaseSeekTorque();
+      if (travel_deg >= 20.0f) {
+        home_hard_track = extreme_track;
+        Serial.print(F("  END track="));
+        Serial.print(extreme_track, 1);
+        Serial.print(F("  travel="));
+        Serial.print(travel_deg, 1);
+        Serial.println(F(" deg"));
+        return true;
+      }
+      Serial.print(F("  blocked — torque off, travel="));
       Serial.print(travel_deg, 1);
-      Serial.println(F(" deg"));
-      return true;
-    }
-    if (travel_deg < 4.0f && (now - t0) > HOME_NO_MOVE_MS) {
-      Serial.println(F("  no movement — not an end"));
+      Serial.println(F(" deg, not an end"));
       return false;
     }
   }
-  if (fabsf(extreme_track - start_track) >= 20.0f) {
-    home_hard_track = extreme_track;
-    home_v_cmd = 0.0f;
-    Serial.print(F("  END on timeout track="));
-    Serial.println(extreme_track, 1);
-    return true;
-  }
+  releaseSeekTorque();
   Serial.println(F("  END TIMEOUT"));
   return false;
 }
@@ -1042,8 +1062,131 @@ static bool driveToShaftRad(float target_shaft_rad, float unused_rpm, uint32_t t
   return ok || fabsf(target_track - home_track_deg) < HOME_MID_OK_DEG;
 }
 
-static void bootHomeCwCcwMid() {
-  Serial.println(F("BOOT HOME — hard span around 270, zero at mid"));
+static void publishSavedStops() {
+  hard_min_deg = cfg.stop_ccw_deg;
+  hard_max_deg = cfg.stop_cw_deg;
+  hard_limits_valid = true;
+  cfg.soft_min_deg = cfg.stop_ccw_deg;
+  cfg.soft_max_deg = cfg.stop_cw_deg;
+  applySoftWindow();
+}
+
+/** Drive to the zero just computed. If the shaft misses it by more than a
+ *  few degrees, put the previous zero back and hold. A false stop must not
+ *  become the saved zero.
+ */
+static bool reachZeroOrKeep(float old_zero) {
+  float zero_shaft = mech_zero_offset;
+  Serial.println(F("  slow drive to pitch 0"));
+  (void)driveToShaftRad(zero_shaft, 0.0f, HOME_MID_MS);
+  sensor.update();
+  float err_deg = fabsf(motor.shaft_angle - zero_shaft) * RAD2DEG;
+  if (err_deg > HOME_MID_OK_DEG) {
+    (void)driveToShaftRad(zero_shaft, 0.0f, HOME_MID_MS);
+    sensor.update();
+    err_deg = fabsf(motor.shaft_angle - zero_shaft) * RAD2DEG;
+  }
+  Serial.print(F("  mid_err="));
+  Serial.println(err_deg, 1);
+  if (err_deg > HOME_MID_OK_DEG) {
+    mech_zero_offset = old_zero;
+    saveConfig(cfg.calib_valid != 0);
+    homed = false;
+    holdShaftHere();
+    Serial.println(F("  zero rejected — previous zero kept, holding"));
+    return false;
+  }
+  homed = true;
+  holdShaftHere();
+  applyAngleCommand(0.0f);
+  saveConfig(cfg.calib_valid != 0);
+  Serial.println(F("  at 0 — hold"));
+  return true;
+}
+
+/** CW stop if the shaft can travel. If it will not move, that point is the
+ *  CW stop. Then always sweep to CCW. The measured span must match EEPROM.
+ *  A mismatch disables the drive, waits 3 s, and tries again, 3 times.
+ */
+static void homeFromFirstHardStop() {
+  Serial.println(F("BOOT HOME — both stops, span must match EEPROM"));
+  home_move = true;
+  jam_grace_until = millis() + 60000UL;
+  homeUseNormalPid();
+
+  float saved_span = cfg.stop_cw_deg - cfg.stop_ccw_deg;
+  float old_zero = cfg.mech_zero_offset;
+  bool ok = false;
+  for (uint8_t attempt = 1; attempt <= HOME_SPAN_TRIES; attempt++) {
+    Serial.print(F("  span check "));
+    Serial.print(attempt);
+    Serial.print(F("/"));
+    Serial.println(HOME_SPAN_TRIES);
+
+    homeTrackReset();
+    bool hit_cw = driveUntilStall(HOME_SEEK_RPM, HOME_TIMEOUT_MS, false);
+    if (!hit_cw) {
+      sensor.update();
+      homeTrackStep();
+      home_hard_shaft = motor.shaft_angle;
+      home_hard_track = home_track_deg;
+      target_position = motor.shaft_angle;
+      angle_goal = target_position;
+      motor.move(target_position);
+      Serial.println(F("  CW already at stop"));
+    }
+    float cw_track = home_hard_track;
+    float cw_shaft = home_hard_shaft;
+    (void)cw_shaft;
+
+    bool hit_ccw = driveUntilStall(-HOME_SEEK_RPM, HOME_TIMEOUT_MS, true);
+    float ccw_track = home_hard_track;
+    float ccw_shaft = home_hard_shaft;
+    float span = fabsf(cw_track - ccw_track);
+    Serial.print(F("  measured span="));
+    Serial.print(span, 1);
+    Serial.print(F("  saved="));
+    Serial.println(saved_span, 1);
+
+    if (hit_ccw && fabsf(span - saved_span) <= HOME_SPAN_MATCH_DEG) {
+      float zero_track = 0.5f * (ccw_track + cw_track);
+      home_zero_track = zero_track;
+      motor.loopFOC();
+      homeTrackStep();
+      float delta = zero_track - home_track_deg;
+      mech_zero_offset = motor.shaft_angle + delta * DEG2RAD;
+      (void)ccw_shaft;
+      publishSavedStops();
+      Serial.println(F("  span OK — go to 0"));
+      (void)reachZeroOrKeep(old_zero);
+      ok = true;
+      break;
+    }
+
+    Serial.println(F("  span mismatch — motor off"));
+    setMotorEnable(false);
+    homed = false;
+    if (attempt >= HOME_SPAN_TRIES) break;
+    delay(HOME_RETRY_MS);
+    setMotorEnable(true);
+    homeUseNormalPid();
+  }
+
+  if (!ok) {
+    home_locked = true;
+    setMotorEnable(false);
+    Serial.println(F("HOME failed 3 times — motor off until reboot"));
+  }
+  home_move = false;
+  jam_grace_until = millis() + JAM_GRACE_MS;
+  last_link_ms = millis();
+  link_held = false;
+  Serial.print(F("HOME done  homed="));
+  Serial.println(homed ? F("yes") : F("no"));
+}
+
+static bool measureStopsFresh() {
+  Serial.println(F("MEASURE — both hard stops, save span"));
   home_move = true;
   jam_grace_until = millis() + 60000UL;
   homeUseNormalPid();
@@ -1054,6 +1197,14 @@ static void bootHomeCwCcwMid() {
 
   // Positive shaft direction is CW on this pitch axis.
   bool hit_cw = driveUntilStall(rpm_pos, HOME_TIMEOUT_MS, false);
+  if (!hit_cw) {
+    sensor.update();
+    homeTrackStep();
+    home_hard_shaft = motor.shaft_angle;
+    home_hard_track = home_track_deg;
+    hit_cw = true;
+    Serial.println(F("  CW already at stop"));
+  }
   float cw_shaft = home_hard_shaft;
   float cw_track = home_hard_track;
   home_cw_track = cw_track;
@@ -1075,49 +1226,27 @@ static void bootHomeCwCcwMid() {
   Serial.print(home_ccw_track, 1);
   Serial.println(F(" deg (accept 200-340)"));
 
-  float err_deg = 999.0f;
   home_move = true;
+  float old_zero = cfg.mech_zero_offset;
 
   if (!hit_cw || !hit_ccw || !adoptPitchFromTracks(home_ccw_track, home_cw_track)) {
     Serial.println(F("HOME rejected — zero unchanged"));
     if (hit_cw && !hit_ccw) backOffFrom(cw_shaft, -1.0f);
-    hard_limits_valid = false;
+    if (!cfg.stops_valid) hard_limits_valid = false;
     homed = false;
     holdShaftHere();
-  } else {
-    float zero_shaft = mech_zero_offset;
-
-    Serial.println(F("  slow drive to pitch 0"));
-    (void)driveToShaftRad(zero_shaft, 0.0f, HOME_MID_MS);
-    sensor.update();
-    err_deg = fabsf(motor.shaft_angle - zero_shaft) * RAD2DEG;
-    if (err_deg > HOME_MID_OK_DEG) {
-      (void)driveToShaftRad(zero_shaft, 0.0f, HOME_MID_MS);
-      sensor.update();
-      err_deg = fabsf(motor.shaft_angle - zero_shaft) * RAD2DEG;
-    }
-
-    // Re-apply soft (zero unchanged) after approach
-    (void)adoptPitchFromTracks(home_ccw_track, home_cw_track);
-    homed = (err_deg < HOME_MID_OK_DEG);
-
-    Serial.print(F("  mid_err="));
-    Serial.print(err_deg, 1);
-    Serial.print(F("  homed="));
-    Serial.println(homed ? F("yes") : F("no"));
-
-    holdShaftHere();
-    if (homed) {
-      applyAngleCommand(0.0f);
-      Serial.println(F("  at 0 — hold"));
-    } else {
-      Serial.println(F("  0 not reached — staying on hold (no yank)"));
-    }
-  }
+  home_move = false;
+  jam_grace_until = millis() + JAM_GRACE_MS;
+  last_link_ms = millis();
+  link_held = false;
+  Serial.println(F("MEASURE rejected"));
+  return false;
+}
+  (void)reachZeroOrKeep(old_zero);
 
   home_move = false;
   jam_grace_until = millis() + JAM_GRACE_MS;
-  Serial.print(F("HOME done  soft["));
+  Serial.print(F("MEASURE done  soft["));
   Serial.print(travel_min_deg, 1);
   Serial.print(F(","));
   Serial.print(travel_max_deg, 1);
@@ -1127,6 +1256,35 @@ static void bootHomeCwCcwMid() {
   Serial.print(can_node);
   Serial.print(F("  homed="));
   Serial.println(homed ? F("yes") : F("no"));
+  last_link_ms = millis();
+  link_held = false;
+  return true;
+}
+
+static void bootHomeCwCcwMid() {
+  if (cfg.stops_valid) {
+    homeFromFirstHardStop();
+    return;
+  }
+  (void)measureStopsFresh();
+}
+
+static void commandMeasureStops() {
+  Serial.println(F("MEASURE STOPS from UI"));
+  bool was_locked = home_locked;
+  bool had_stops = cfg.stops_valid != 0;
+  setMotorEnable(true, true);
+  bool ok = measureStopsFresh();
+  if (ok) {
+    home_locked = false;
+  } else {
+    Serial.println(F("MEASURE STOPS rejected — previous span kept"));
+    if (had_stops && cfg.stops_valid) publishSavedStops();
+    if (was_locked) {
+      home_locked = true;
+      setMotorEnable(false);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,9 +1454,11 @@ static void sendParamsCan() {
 static void pollCan() {
   if (!can_ready) return;
   CAN_message_t rx;
-  while (Can1.read(rx)) {
-    uint16_t off = rx.id - can_cmd_base;
-    switch (off) {
+    while (Can1.read(rx)) {
+      uint16_t off = rx.id - can_cmd_base;
+      last_link_ms = millis();
+      link_held = false;
+      switch (off) {
       case ORBIT_CMD_SET_ANGLE:
         if (rx.len >= 4) { float d; memcpy(&d, rx.buf, 4); applyAngleCommand(d); }
         break;
@@ -1328,6 +1488,17 @@ static void pollCan() {
         break;
       case ORBIT_CMD_SET_ENABLE:
         if (rx.len >= 1) setMotorEnable(rx.buf[0] != 0);
+        break;
+      case ORBIT_CMD_REBOOT:
+        Serial.println(F("REBOOT"));
+        Serial.flush();
+        delay(20);
+        NVIC_SystemReset();
+        break;
+      case ORBIT_CMD_MEASURE_STOPS:
+        commandMeasureStops();
+        break;
+      case ORBIT_CMD_HEARTBEAT:
         break;
       default:
         break;
@@ -1438,7 +1609,8 @@ void setup() {
     setDefaultTuning();
     cfg.can_node_id = ORBIT_DEF_CAN_NODE;
     cfg.calib_valid = 0;
-    Serial.println(F("Config: empty EEPROM — defaults + will FOC-align once"));
+    cfg.stops_valid = 0;
+    Serial.println(F("Config: empty EEPROM — align once, then measure the sweep once"));
   } else if (!version_ok) {
     uint16_t from_ver = cfg.version;
     Serial.print(F("Config: migrating EEPROM v"));
@@ -1484,16 +1656,31 @@ void setup() {
       cfg.soft_max_deg = ORBIT_DEF_SOFT_MAX;
       Serial.println(F("Soft window opened to -135/+135"));
     }
+    if (from_ver < 25) {
+      // This flash only: align again and measure both stops. Later boots reuse both.
+      cfg.calib_valid = 0;
+      cfg.stops_valid = 0;
+      Serial.println(F("Flash once: electrical align + full sweep, then save"));
+    }
+    if (from_ver < 26) {
+      cfg.prestop_deg = ORBIT_DEF_PRESTOP;
+    }
     cfg.version = ORBIT_CFG_VERSION;
   } else {
     Serial.println(F("Config: EEPROM OK"));
   }
 
   applyCanNode(cfg.can_node_id);
-  cfg.soft_min_deg = ORBIT_DEF_SOFT_MIN;
-  cfg.soft_max_deg = ORBIT_DEF_SOFT_MAX;
+  use_calib = electricalCalibUsable();
+  if (cfg.stops_valid) {
+    publishSavedStops();
+  } else {
+    // Placeholder until this boot's end-stop sweep replaces it. Not a travel limit.
+    cfg.soft_min_deg = ORBIT_DEF_SOFT_MIN;
+    cfg.soft_max_deg = ORBIT_DEF_SOFT_MAX;
+    applySoftWindow();
+  }
   applyTuning();
-  applySoftWindow();
   Serial.print(F("CAN node id: ")); Serial.println(can_node);
   Serial.print(F("Tuning: "));
   Serial.println(have_store ? F("from EEPROM") : F("defaults"));
@@ -1608,6 +1795,15 @@ void loop() {
 
   pollSerial();
   pollCan();
+  if (!home_move && can_ready && last_link_ms != 0 && !link_held &&
+      (millis() - last_link_ms > CAN_LINK_IDLE_MS)) {
+    link_held = true;
+    if (motor.enabled && !endstop_fault &&
+        (vel_mode || fabsf(angle_goal - motor.shaft_angle) > (2.0f * DEG2RAD))) {
+      Serial.println(F("CAN link idle — hold shaft"));
+      holdShaftHere();
+    }
+  }
 
   static uint32_t last_tel = 0;
   uint32_t now = millis();

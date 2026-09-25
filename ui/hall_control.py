@@ -9,7 +9,9 @@ Controls: angle slider, velocity RPM, velocity/angle/torque PID, EKF.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import struct
 import threading
 import time
@@ -41,6 +43,9 @@ CMD_GET_PARAMS = 0x07
 CMD_SET_NODE = 0x08
 CMD_SET_VEL = 0x09
 CMD_SET_ENABLE = 0x0A
+CMD_REBOOT = 0x0B
+CMD_MEASURE_STOPS = 0x0C
+CMD_HEARTBEAT = 0x0D
 
 RPT_TELEMETRY = 0x01
 RPT_PARAM = 0x02
@@ -58,6 +63,26 @@ P_ACCEL = 15
 P_DECEL = 16
 P_SOFT_MIN = 17
 P_SOFT_MAX = 18
+P_PRESTOP = 19
+
+# Gains that were running well before the closed-loop nudge. Always available.
+REFERENCE_PRESET = {
+    "name": "Working reference",
+    "locked": True,
+    "values": {
+        "0": 0.026, "1": 0.30, "2": 0.0012, "3": 70.0,
+        "4": 50.0, "5": 0.05,
+        "10": 4.0, "11": 10.0, "12": 0.3, "13": 0.005,
+        "14": 360.0, "15": 1000.0, "16": 1000.0,
+    },
+}
+
+
+def _preset_file() -> str:
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "OrbitDrive_HALL_5")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "pid_presets.json")
 
 WS_BAUD = 2_000_000
 WINDOW_S = 12.0
@@ -252,10 +277,10 @@ class HallControlApp:
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        left = ttk.Frame(body, padding=4)
-        right = ttk.Frame(body, padding=4)
-        body.add(left, weight=3)
-        body.add(right, weight=2)
+        left_host, left = self._scroll_pane(body)
+        right_host, right = self._scroll_pane(body)
+        body.add(left_host, weight=3)
+        body.add(right_host, weight=2)
 
         # Angle control
         ang = ttk.LabelFrame(left, text="Angle command", padding=8)
@@ -290,7 +315,15 @@ class HallControlApp:
         ttk.Button(lim_row, text="Apply limits", command=self._apply_soft_limits).pack(
             side=tk.LEFT, padx=6
         )
-        ttk.Button(lim_row, text="-45/+90", command=self._preset_soft_pitch).pack(side=tk.LEFT, padx=2)
+        ttk.Button(lim_row, text="-135/+135", command=self._preset_soft_pitch).pack(side=tk.LEFT, padx=2)
+
+        pre_row = ttk.Frame(ang)
+        pre_row.pack(fill=tk.X, pady=2)
+        ttk.Label(pre_row, text="Prestop").pack(side=tk.LEFT)
+        self.prestop_var = tk.StringVar(value="2.0")
+        ttk.Entry(pre_row, textvariable=self.prestop_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pre_row, text="° inside each hard stop").pack(side=tk.LEFT)
+        ttk.Button(pre_row, text="Apply", command=self._apply_prestop).pack(side=tk.LEFT, padx=6)
 
         row = ttk.Frame(ang)
         row.pack(fill=tk.X, pady=4)
@@ -301,7 +334,12 @@ class HallControlApp:
         ttk.Button(row, text="Set °", command=self._set_manual).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="Zero", command=self._zero).pack(side=tk.LEFT, padx=2)
         ttk.Button(row, text="Go 0", command=lambda: self._send_angle(0.0)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row, text="Save CFG", command=self._save).pack(side=tk.LEFT, padx=2)
+
+        acts = ttk.Frame(ang)
+        acts.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(acts, text="Enable", command=self._enable).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(acts, text="Measure stops", command=self._measure_stops).pack(side=tk.LEFT, padx=2)
+        ttk.Button(acts, text="Save CFG", command=self._save).pack(side=tk.LEFT, padx=2)
 
         osc = ttk.Frame(ang)
         osc.pack(fill=tk.X, pady=4)
@@ -365,10 +403,17 @@ class HallControlApp:
         self.canvas = canvas
         self.fig = fig
 
-        # Right: PID panels
+        # Right: live PID and saved presets
+        nb = ttk.Notebook(right)
+        nb.pack(fill=tk.BOTH, expand=True)
+        live = ttk.Frame(nb, padding=4)
+        presets = ttk.Frame(nb, padding=4)
+        nb.add(live, text="PID")
+        nb.add(presets, text="Presets")
+
         self.entries: dict[int, tk.StringVar] = {}
         self._pid_frame(
-            right,
+            live,
             "Angle loop",
             [
                 (P_ANGLE_P, "Angle P"),
@@ -379,17 +424,17 @@ class HallControlApp:
             ],
         )
         self._pid_frame(
-            right,
+            live,
             "Velocity PID",
             [(P_VEL_P, "Vel P"), (P_VEL_I, "Vel I"), (P_VEL_D, "Vel D"), (P_VEL_RAMP, "Vel ramp")],
         )
         self._pid_frame(
-            right,
+            live,
             "Torque (current) PID",
             [(P_TRQ_P, "Trq P"), (P_TRQ_I, "Trq I"), (P_TRQ_D, "Trq D"), (P_TRQ_LPF, "Trq LPF")],
         )
 
-        ekf = ttk.LabelFrame(right, text="Hall angle EKF", padding=8)
+        ekf = ttk.LabelFrame(live, text="Hall angle EKF", padding=8)
         ekf.pack(fill=tk.X, pady=4)
         self.ekf_en = tk.BooleanVar(value=False)
         ttk.Checkbutton(ekf, text="Enable EKF", variable=self.ekf_en).pack(anchor=tk.W)
@@ -408,15 +453,45 @@ class HallControlApp:
                 side=tk.LEFT, padx=4
             )
 
-        btns = ttk.Frame(right)
+        btns = ttk.Frame(live)
         btns.pack(fill=tk.X, pady=8)
         ttk.Button(btns, text="Apply all PIDs", command=self._apply_pids).pack(fill=tk.X, pady=2)
         ttk.Button(btns, text="Save PIDs to EEPROM", command=self._save_pids_eeprom).pack(fill=tk.X, pady=2)
         ttk.Button(btns, text="Get params from board", command=self._get_params).pack(fill=tk.X, pady=2)
         ttk.Button(btns, text="Recalibrate (reboot)", command=self._recal).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Reboot", command=self._reboot).pack(fill=tk.X, pady=2)
+
+        self._build_presets(presets)
 
         self.log = tk.Text(right, height=8, width=36, font=("Consolas", 9))
         self.log.pack(fill=tk.BOTH, expand=True, pady=4)
+
+    def _scroll_pane(self, parent):
+        """Vertical scrollbar so every control stays reachable."""
+        host = ttk.Frame(parent)
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        canvas = tk.Canvas(host, highlightthickness=0, borderwidth=0, bg=bg)
+        bar = ttk.Scrollbar(host, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        inner = ttk.Frame(canvas, padding=4)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _fit_width(event):
+            canvas.itemconfigure(window, width=event.width)
+
+        def _fit_scroll(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<Configure>", _fit_width)
+        inner.bind("<Configure>", _fit_scroll)
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        return host, inner
 
     def _pid_frame(self, parent, title, fields):
         fr = ttk.LabelFrame(parent, text=title, padding=8)
@@ -435,6 +510,134 @@ class HallControlApp:
             ttk.Button(r, text="Set", width=4, command=lambda i=idx: self._apply_one(i)).pack(
                 side=tk.LEFT, padx=4
             )
+
+    def _build_presets(self, parent):
+        ttk.Label(
+            parent,
+            text="Save the fields on the PID tab. Working reference is the set that was already running well.",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(0, 6))
+        self.preset_list = tk.Listbox(parent, height=8, exportselection=False)
+        self.preset_list.pack(fill=tk.BOTH, expand=True)
+        self.preset_name = tk.StringVar()
+        ttk.Entry(parent, textvariable=self.preset_name).pack(fill=tk.X, pady=4)
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X)
+        ttk.Button(row, text="Save", command=self._preset_save).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="Load", command=self._preset_load).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="Apply", command=self._preset_apply).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="Delete", command=self._preset_delete).pack(side=tk.LEFT, padx=2)
+        self._presets = []
+        self._preset_load_file()
+        self._preset_refresh()
+
+    def _preset_load_file(self):
+        rows = []
+        path = _preset_file()
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    rows = json.load(f)
+            except Exception:
+                rows = []
+        if not isinstance(rows, list):
+            rows = []
+        have_ref = any(isinstance(r, dict) and r.get("name") == REFERENCE_PRESET["name"] for r in rows)
+        if not have_ref:
+            rows.insert(0, json.loads(json.dumps(REFERENCE_PRESET)))
+        self._presets = [r for r in rows if isinstance(r, dict) and r.get("name")]
+
+    def _preset_write(self):
+        with open(_preset_file(), "w", encoding="utf-8") as f:
+            json.dump(self._presets, f, indent=2)
+
+    def _preset_refresh(self):
+        self.preset_list.delete(0, tk.END)
+        for row in self._presets:
+            self.preset_list.insert(tk.END, row.get("name", ""))
+
+    def _preset_selected(self):
+        sel = self.preset_list.curselection()
+        if not sel:
+            return None
+        i = int(sel[0])
+        if i < 0 or i >= len(self._presets):
+            return None
+        return self._presets[i]
+
+    def _capture_pid_fields(self) -> dict:
+        out = {}
+        for idx, var in self.entries.items():
+            s = var.get().strip()
+            if not s:
+                continue
+            try:
+                out[str(idx)] = float(s)
+            except ValueError:
+                continue
+        return out
+
+    def _fill_pid_fields(self, values: dict):
+        for key, val in values.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if idx in self.entries:
+                self.entries[idx].set(f"{float(val):.5g}")
+
+    def _preset_save(self):
+        name = self.preset_name.get().strip()
+        if not name:
+            messagebox.showinfo("Presets", "Type a name first")
+            return
+        if name == REFERENCE_PRESET["name"]:
+            messagebox.showinfo("Presets", "Working reference stays as it is")
+            return
+        values = self._capture_pid_fields()
+        if len(values) < 4:
+            messagebox.showinfo("Presets", "PID fields are empty. Get params or type values first.")
+            return
+        for row in self._presets:
+            if row.get("name") == name and not row.get("locked"):
+                row["values"] = values
+                break
+        else:
+            self._presets.append({"name": name, "locked": False, "values": values})
+        self._preset_write()
+        self._preset_refresh()
+        self._log(f"preset saved: {name}")
+
+    def _preset_load(self):
+        row = self._preset_selected()
+        if row is None:
+            messagebox.showinfo("Presets", "Select a preset")
+            return
+        self._fill_pid_fields(row.get("values") or {})
+        self.preset_name.set(row.get("name", ""))
+        self._log(f"preset loaded into fields: {row.get('name')}")
+
+    def _preset_apply(self):
+        row = self._preset_selected()
+        if row is None:
+            messagebox.showinfo("Presets", "Select a preset")
+            return
+        self._fill_pid_fields(row.get("values") or {})
+        self.preset_name.set(row.get("name", ""))
+        self._log(f"preset loaded into fields: {row.get('name')}")
+        self._apply_pids()
+
+    def _preset_delete(self):
+        row = self._preset_selected()
+        if row is None:
+            return
+        if row.get("locked") or row.get("name") == REFERENCE_PRESET["name"]:
+            messagebox.showinfo("Presets", "Working reference cannot be deleted")
+            return
+        self._presets = [r for r in self._presets if r.get("name") != row.get("name")]
+        self._preset_write()
+        self._preset_refresh()
+        self._log(f"preset deleted: {row.get('name')}")
 
     def _log(self, msg: str):
         self.log.insert(tk.END, msg + "\n")
@@ -632,9 +835,26 @@ class HallControlApp:
         self._send(self._cmd(CMD_SET_ANGLE), payload)
         self._log(f"SET_ANGLE {deg_in:.2f} -> {deg:.2f}° (id=0x{self._cmd(CMD_SET_ANGLE):03X})")
 
+    def _apply_prestop(self):
+        if not self.connected:
+            messagebox.showinfo("Prestop", "Connect first")
+            return
+        try:
+            deg = float(self.prestop_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Prestop", "Enter a number of degrees")
+            return
+        if deg < 0.0 or deg > 40.0:
+            messagebox.showerror("Prestop", "Use 0 to 40°")
+            return
+        self._send(self._cmd(CMD_SET_PARAM), bytes([P_PRESTOP]) + struct.pack("<f", deg))
+        with self.lock:
+            self.params[P_PRESTOP] = deg
+        self._log(f"SET prestop {deg:.1f}° inside each hard stop (Save CFG to keep)")
+
     def _preset_soft_pitch(self):
-        self.soft_min_var.set("-45.0")
-        self.soft_max_var.set("90.0")
+        self.soft_min_var.set("-135.0")
+        self.soft_max_var.set("135.0")
         self._apply_soft_limits()
 
     def _apply_soft_limits(self):
@@ -650,8 +870,8 @@ class HallControlApp:
         if hi < lo + 4.0:
             messagebox.showerror("Soft limits", "max must be at least min + 4°")
             return
-        if lo < -100.0 or hi > 100.0:
-            messagebox.showerror("Soft limits", "Keep limits within ±100°")
+        if lo < -135.0 or hi > 135.0:
+            messagebox.showerror("Soft limits", "Keep limits within ±135°")
             return
         self._send(self._cmd(CMD_SET_PARAM), bytes([P_SOFT_MIN]) + struct.pack("<f", lo))
         time.sleep(0.02)
@@ -796,6 +1016,20 @@ class HallControlApp:
             self._log("Scan: no Orbit nodes heard")
             messagebox.showinfo("Scan", "No Orbit Drive telemetry heard. Check power / CAN / baud.")
 
+    def _enable(self):
+        self._send(self._cmd(CMD_SET_ENABLE), bytes([1]))
+        self._log("ENABLE — fault cleared, holding here")
+
+    def _measure_stops(self):
+        if not messagebox.askyesno(
+            "Measure stops",
+            "Sweep both hard stops and replace the saved span?\n\n"
+            "The shaft will drive to each end. Keep hands clear.",
+        ):
+            return
+        self._send(self._cmd(CMD_MEASURE_STOPS))
+        self._log("MEASURE STOPS")
+
     def _save(self):
         self._send(self._cmd(CMD_SAVE_CFG))
         self._log("SAVE_CFG")
@@ -863,6 +1097,11 @@ class HallControlApp:
         if messagebox.askyesno("Recalibrate", "Invalidate FOC calib and reboot?"):
             self._send(self._cmd(CMD_RECALIBRATE))
             self._log("RECALIBRATE")
+
+    def _reboot(self):
+        if messagebox.askyesno("Reboot", "Restart the drive? Homing runs again."):
+            self._send(self._cmd(CMD_REBOOT))
+            self._log("REBOOT")
 
     def _apply_pids(self):
         if not self.connected:
@@ -1027,6 +1266,8 @@ class HallControlApp:
                     self.soft_min_var.set(f"{params[P_SOFT_MIN]:.1f}")
                 if P_SOFT_MAX in params:
                     self.soft_max_var.set(f"{params[P_SOFT_MAX]:.1f}")
+                if P_PRESTOP in params:
+                    self.prestop_var.set(f"{params[P_PRESTOP]:.1f}")
 
         if len(t) >= 2:
             t0 = t[-1] - WINDOW_S
@@ -1050,6 +1291,10 @@ class HallControlApp:
             self.ax_hall.set_xlim(0, WINDOW_S)
             self.ax_ang.set_xlim(0, WINDOW_S)
             self.canvas.draw_idle()
+
+        if self.connected and (time.monotonic() - getattr(self, "_hb_t", 0.0)) >= 0.25:
+            self._hb_t = time.monotonic()
+            self._send(self._cmd(CMD_HEARTBEAT))
 
         self.root.after(50, self._ui_tick)
 
